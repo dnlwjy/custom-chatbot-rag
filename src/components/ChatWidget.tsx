@@ -1,25 +1,6 @@
-import React, { useState, useEffect, useRef } from 'react'
-import { useLocation } from 'react-router-dom'
 import { KNOWLEDGE_BASE_CHUNKS, type KnowledgeChunk } from '../data/knowledgeBase'
-import './ChatWidget.css'
-
-interface Message {
-  id: string
-  role: 'user' | 'assistant'
-  content: string
-  timestamp: Date
-  retrievedDocs?: Array<{
-    id: string
-    pageTitle: string
-    score: number
-    text: string
-  }>
-}
-
-interface CachedEmbedding {
-  id: string
-  vector: number[]
-}
+import { useChatLogic, type Message } from '../lib/useChatLogic'
+import { parseMarkdown } from '../lib/markdown'
 
 export interface ChatWidgetProps {
   knowledgeBase?: KnowledgeChunk[]
@@ -34,716 +15,54 @@ export default function ChatWidget({
   welcomeMessage,
   demoMode = true
 }: ChatWidgetProps) {
-  const location = useLocation()
-  const [isOpen, setIsOpen] = useState(false)
-  const [showSettings, setShowSettings] = useState(false)
-  const [hasNewMessage, setHasNewMessage] = useState(false)
-
-  // Settings state (loads from localStorage or env default)
-  const [apiKey, setApiKey] = useState(() => {
-    return localStorage.getItem('openai_api_key') || ''
+  const {
+    isOpen,
+    setIsOpen,
+    showSettings,
+    setShowSettings,
+    hasNewMessage,
+    messages,
+    inputValue,
+    setInputValue,
+    isStreaming,
+    apiKey,
+    setApiKey,
+    model,
+    setModel,
+    temperature,
+    setTemperature,
+    dbStatus,
+    dbError,
+    embeddingsDb,
+    getSuggestionChips,
+    initializeVectorDb,
+    getApiKey,
+    handleSaveSettings,
+    handleStopStream,
+    handleSendMessage,
+    messagesEndRef,
+    textareaRef
+  } = useChatLogic({
+    knowledgeBase,
+    botName,
+    welcomeMessage,
+    demoMode
   })
-  const [model, setModel] = useState(() => {
-    return localStorage.getItem('openai_model') || 'gpt-5-nano'
-  })
-  const [temperature, setTemperature] = useState(() => {
-    const saved = localStorage.getItem('openai_temp')
-    return saved ? parseFloat(saved) : 0.7
-  })
 
-  // RAG / Vector DB states
-  const [dbStatus, setDbStatus] = useState<'pending' | 'loading' | 'ready' | 'error'>('pending')
-  const [dbError, setDbError] = useState('')
-  const [embeddingsDb, setEmbeddingsDb] = useState<CachedEmbedding[]>([])
-
-  // Chat conversation state
-  const [messages, setMessages] = useState<Message[]>([])
-  const [inputValue, setInputValue] = useState('')
-  const [isStreaming, setIsStreaming] = useState(false)
-
-  const messagesEndRef = useRef<HTMLDivElement>(null)
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
-  const abortControllerRef = useRef<AbortController | null>(null)
-  const mockIntervalRef = useRef<any>(null)
-
-  // Map route to user-friendly page context name
-  const getPageContext = () => {
-    switch (location.pathname) {
-      case '/':
-        return 'Artificial Intelligence'
-      case '/about':
-        return 'Robotics'
-      case '/services':
-        return 'Quantum Computing'
-      case '/contact':
-        return 'Space Exploration'
-      default:
-        return 'General'
-    }
-  }
-
-  const pageContext = getPageContext()
-
-  // Suggestion chips based on active page
-  const getSuggestionChips = () => {
-    switch (location.pathname) {
-      case '/':
-        return [
-          'What is generative AI?',
-          'Explain Neural Networks in simple terms.',
-          'What are the main ethical concerns of AI?'
-        ]
-      case '/about':
-        return [
-          'What is the difference between automation and robotics?',
-          'How do robots use sensors to perceive environment?',
-          'Tell me about humanoid robot developments.'
-        ]
-      case '/services':
-        return [
-          'What is a qubit and superposition?',
-          'How does quantum computing break encryption?',
-          'What industries will quantum computing affect most?'
-        ]
-      case '/contact':
-        return [
-          'What are some planned Mars missions?',
-          'Why is space exploration beneficial for Earth?',
-          'What are the key goals of Artemis program?'
-        ]
-      default:
-        return [
-          'What can you do?',
-          'Explain the topics on this website.',
-          'Tell me a science joke.'
-        ]
-    }
-  }
-
-  // --- RAG / VECTOR DB LOGIC ---
-
-  // Get active key from localStorage or project env
-  const getApiKey = () => {
-    return apiKey || (import.meta.env.VITE_OPENAI_API_KEY as string) || ''
-  }
-
-  // Function to compute cosine similarity (dot product since OpenAI vectors are normalized)
-  const calculateCosineSimilarity = (vecA: number[], vecB: number[]) => {
-    if (vecA.length !== vecB.length) return 0
-    let dotProduct = 0
-    for (let i = 0; i < vecA.length; i++) {
-      dotProduct += vecA[i] * vecB[i]
-    }
-    return dotProduct
-  }
-
-  // Generate vector embedding for a single text (uses text-embedding-3-small)
-  const fetchEmbedding = async (text: string, key: string): Promise<number[]> => {
-    const url = key ? 'https://api.openai.com/v1/embeddings' : '/api/embeddings'
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json'
-    }
-    if (key) {
-      headers['Authorization'] = `Bearer ${key}`
-    }
-
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: headers,
-      body: JSON.stringify({
-        model: 'text-embedding-3-small',
-        input: text
-      })
-    })
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}))
-      throw new Error(err.error?.message || `Embedding API HTTP ${res.status}`)
-    }
-
-    const json = await res.json()
-    // For direct OpenAI API response it is json.data[0].embedding.
-    // Our proxy returns the exact same payload.
-    return json.data[0].embedding
-  }
-
-  // Fetch embeddings in batch for all database chunks
-  const fetchBatchEmbeddings = async (texts: string[], key: string): Promise<number[][]> => {
-    const url = key ? 'https://api.openai.com/v1/embeddings' : '/api/embeddings'
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json'
-    }
-    if (key) {
-      headers['Authorization'] = `Bearer ${key}`
-    }
-
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: headers,
-      body: JSON.stringify({
-        model: 'text-embedding-3-small',
-        input: texts
-      })
-    })
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}))
-      throw new Error(err.error?.message || `Embedding Batch API HTTP ${res.status}`)
-    }
-
-    const json = await res.json()
-    return json.data.map((item: any) => item.embedding)
-  }
-
-  // Initialize/build vector database
-  const initializeVectorDb = async (forceRebuild = false) => {
-    const key = getApiKey()
-
-    setDbStatus('loading')
-    setDbError('')
-
-    try {
-      const cacheKey = `rag_embeddings_db`
-      const cached = localStorage.getItem(cacheKey)
-
-      if (cached && !forceRebuild) {
-        const parsed = JSON.parse(cached)
-        // Verify cache length matches current chunk count
-        if (parsed.length === KNOWLEDGE_BASE_CHUNKS.length) {
-          setEmbeddingsDb(parsed)
-          setDbStatus('ready')
-          return
-        }
-      }
-
-      // Fetch batch embeddings (will run directly if key is configured, or route to /api/embeddings proxy)
-      const textsToEmbed = KNOWLEDGE_BASE_CHUNKS.map((c) => c.text)
-      const vectors = await fetchBatchEmbeddings(textsToEmbed, key)
-
-      const newDb: CachedEmbedding[] = KNOWLEDGE_BASE_CHUNKS.map((chunk, idx) => ({
-        id: chunk.id,
-        vector: vectors[idx]
-      }))
-
-      localStorage.setItem(cacheKey, JSON.stringify(newDb))
-      setEmbeddingsDb(newDb)
-      setDbStatus('ready')
-    } catch (err: any) {
-      console.error('Failed to build vector DB:', err)
-
-      // If we don't have a local key AND the proxy fails (e.g. running locally without Vercel API routes),
-      // we gracefully fall back to 'pending' to prompt the developer for a key.
-      if (!key) {
-        setDbStatus('pending')
-      } else {
-        setDbError(err.message || 'Error creating embeddings')
-        setDbStatus('error')
-      }
-    }
-  }
-
-  // Trigger vector DB initialization on mount or key/settings change
-  useEffect(() => {
-    if (demoMode) {
-      setDbStatus('ready')
-    } else {
-      initializeVectorDb()
-    }
-  }, [apiKey, demoMode])
-
-  // --- CHAT CONVERSATION FLOW ---
-
-  // Reset conversation with welcome message on route change
-  useEffect(() => {
-    const context = getPageContext()
-    const welcomeMsg: Message = {
-      id: 'welcome-' + location.pathname,
-      role: 'assistant',
-      content: welcomeMessage || `Hello! I am your RAG-powered AI assistant.
-
-I have loaded a semantic search index of the **entire website** (12 paragraphs across all 4 pages). 
-
-You can ask me questions about **${context}**, or test the RAG capability by asking about any other topic (e.g. asking about *Qubits* while on the *Robotics* page). I will search for and retrieve the most relevant sections in real time!`,
-      timestamp: new Date()
-    }
-
-    setMessages([welcomeMsg])
-
-    if (!isOpen && messages.length > 0) {
-      setHasNewMessage(true)
-    }
-  }, [location.pathname])
-
-  // Scroll to bottom
-  useEffect(() => {
-    if (isOpen) {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-    }
-  }, [messages, isOpen])
-
-  // Clear badge
-  useEffect(() => {
-    if (isOpen) {
-      setHasNewMessage(false)
-    }
-  }, [isOpen])
-
-  // Toggle 'chat-open' class on body to shift page layout
-  useEffect(() => {
-    if (isOpen) {
-      document.body.classList.add('chat-open')
-    } else {
-      document.body.classList.remove('chat-open')
-    }
-    return () => {
-      document.body.classList.remove('chat-open')
-    }
-  }, [isOpen])
-
-  // Auto-resize input textarea
-  useEffect(() => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = '40px'
-      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 120)}px`
-    }
-  }, [inputValue])
-
-  const handleSaveSettings = (e: React.FormEvent) => {
-    e.preventDefault()
-    localStorage.setItem('openai_api_key', apiKey)
-    localStorage.setItem('openai_model', model)
-    localStorage.setItem('openai_temp', temperature.toString())
-    setShowSettings(false)
-    // Force rebuild on settings change to make sure the key works
-    initializeVectorDb(true)
-  }
-
-  const handleStopStream = () => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort()
-      setIsStreaming(false)
-    }
-    if (mockIntervalRef.current) {
-      clearInterval(mockIntervalRef.current)
-      mockIntervalRef.current = null
-      setIsStreaming(false)
-    }
-  }
-
-  const handleSendMessage = async (textToSend: string) => {
-    const trimmed = textToSend.trim()
-    if (!trimmed || isStreaming) return
-
-    setInputValue('')
-
-    const userMessage: Message = {
-      id: Math.random().toString(36).substring(7),
-      role: 'user',
-      content: trimmed,
-      timestamp: new Date()
-    }
-
-    const assistantMessageId = Math.random().toString(36).substring(7)
-    const assistantMessagePlaceholder: Message = {
-      id: assistantMessageId,
-      role: 'assistant',
-      content: '',
-      timestamp: new Date()
-    }
-
-    setMessages((prev) => [...prev, userMessage, assistantMessagePlaceholder])
-    setIsStreaming(true)
-
-    if (demoMode) {
-      // 1. MOCK RAG PHASE - Search over knowledgeBase using local keyword math
-      // Clean and split query words
-      const queryWords = trimmed.toLowerCase()
-        .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, "")
-        .split(/\s+/)
-        .filter(word => word.length > 2);
-
-      let matchedDocs: any[] = [];
-      
-      if (queryWords.length > 0) {
-        const scored = knowledgeBase.map(chunk => {
-          const docTextLower = chunk.text.toLowerCase();
-          const pageTitleLower = chunk.pageTitle.toLowerCase();
-          let matchCount = 0;
-          queryWords.forEach(word => {
-            if (docTextLower.includes(word)) {
-              matchCount += 1;
-              if (pageTitleLower.includes(word)) {
-                matchCount += 1.5;
-              }
-            }
-          });
-          
-          // Calculate score (normalized)
-          const score = matchCount > 0 ? Math.min(30 + (matchCount * 15), 98) : 0;
-          return { ...chunk, score };
-        });
-
-        matchedDocs = scored
-          .filter(item => item.score > 0)
-          .sort((a, b) => b.score - a.score)
-          .slice(0, 3);
-      }
-
-      const retrievedDocs: Message['retrievedDocs'] = matchedDocs.map(chunk => ({
-        id: chunk.id,
-        pageTitle: chunk.pageTitle,
-        score: chunk.score,
-        text: chunk.text
-      }));
-
-      // Add retrieved docs to user message for UI display
-      setMessages((prev) =>
-        prev.map((msg) =>
-          msg.id === userMessage.id ? { ...msg, retrievedDocs } : msg
-        )
-      );
-
-      // Check for out of scope
-      const isGreeting = /^(hi|hello|hey|good\s+morning|good\s+afternoon|good\s+evening|yo|greetings|help|who\s+are\s+you|what\s+is\s+this\s+website|what\s+can\s+you\s+do|how\s+to\s+use)(\b|\?|$)/i.test(trimmed);
-      const maxScore = retrievedDocs.length > 0 ? Math.max(...retrievedDocs.map(d => d.score)) : 0;
-
-      let responseText = "";
-
-      if (!isGreeting && maxScore < 30) {
-        responseText = "I am sorry, but that topic is out of scope for this website. I can only assist you with questions related to Artificial Intelligence, Robotics, Quantum Computing, and Space Exploration.";
-      } else if (isGreeting) {
-        responseText = `Hello! I am your RAG AI Assistant (running in Demo Mode). 
-
-I can answer questions using context from the current page (**${pageContext}**) or search across all pages of the site using local mock RAG. Ask me anything about Artificial Intelligence, Robotics, Quantum Computing, or Space Exploration!`;
-      } else {
-        const topDoc = matchedDocs[0];
-        responseText = `This will be a response generated by the RAG AI about **${topDoc.pageTitle}**.
-
-Based on the retrieved website documentation:
-> *"${topDoc.text.slice(0, 160)}..."*
-
-Here is what we know:
-1. This is a **Mock Demo Response** illustrating the client-side RAG engine.
-2. The user query matched the **${topDoc.category}** category with a simulated similarity score of **${maxScore}%**.
-3. In a production environment, this matched text block would be fed into the OpenAI model to generate a custom answer.`;
-      }
-
-      // Stream the mock response character by character
-      let currentContent = '';
-      let charIndex = 0;
-      
-      const interval = setInterval(() => {
-        if (charIndex < responseText.length) {
-          currentContent += responseText.charAt(charIndex);
-          setMessages((prev) =>
-            prev.map((msg) =>
-              msg.id === assistantMessageId
-                ? { ...msg, content: currentContent }
-                : msg
-            )
-          );
-          charIndex++;
-        } else {
-          clearInterval(interval);
-          setIsStreaming(false);
-          mockIntervalRef.current = null;
-        }
-      }, 15);
-
-      mockIntervalRef.current = interval as any;
-      return;
-    }
-
-    const keyToUse = getApiKey()
-
-    // If no key is set locally, AND we don't have a ready RAG vector database (e.g. proxy is offline or not configured)
-    if (!keyToUse && dbStatus !== 'ready') {
-      setTimeout(() => {
-        setMessages((prev) =>
-          prev.map((msg) =>
-            msg.id === assistantMessageId
-              ? {
-                ...msg,
-                content: `⚠️ **OpenAI API Key is missing.** 
-                  
-To activate the RAG engine and chat with the AI, configure your OpenAI API Key by clicking the **Settings Gear Icon** at the top right of this sidebar. Get a key from the [OpenAI Platform](https://platform.openai.com/).`
-              }
-              : msg
-          )
-        )
-        setIsStreaming(false)
-      }, 600)
-      return
-    }
-
-    let retrievedDocs: Message['retrievedDocs'] = []
-    let promptContext = ''
-
-    try {
-      // 1. RAG PHASE - Semantic Search Vector Retrieval
-      if (dbStatus === 'ready' && embeddingsDb.length > 0) {
-        // Fetch embedding for the user's query
-        const queryVector = await fetchEmbedding(trimmed, keyToUse)
-
-        // Calculate similarity scores against all database chunks
-        const scoredChunks = KNOWLEDGE_BASE_CHUNKS.map((chunk) => {
-          const cached = embeddingsDb.find((e) => e.id === chunk.id)
-          const score = cached ? calculateCosineSimilarity(queryVector, cached.vector) : 0
-          return { ...chunk, score }
-        })
-
-        // Sort by score and grab top 3
-        const sorted = scoredChunks
-          .sort((a, b) => b.score - a.score)
-          .slice(0, 3)
-
-        retrievedDocs = sorted.map((chunk) => ({
-          id: chunk.id,
-          pageTitle: chunk.pageTitle,
-          score: Math.round(chunk.score * 100), // convert similarity to %
-          text: chunk.text
-        }))
-
-        // Format chunks into prompt text context
-        promptContext = retrievedDocs
-          .map((doc, idx) => `[Document ${idx + 1}] Source page: ${doc.pageTitle}\nContent: ${doc.text}`)
-          .join('\n\n')
-
-        // Guardrail: Intercept off-topic questions client-side to save OpenAI tokens
-        const isGreeting = /^(hi|hello|hey|good\s+morning|good\s+afternoon|good\s+evening|yo|greetings|help|who\s+are\s+you|what\s+is\s+this\s+website|what\s+can\s+you\s+do|how\s+to\s+use)(\b|\?|$)/i.test(trimmed);
-        const maxScore = retrievedDocs.length > 0 ? Math.max(...retrievedDocs.map(d => d.score)) : 0;
-
-        if (!isGreeting && maxScore < 30) {
-          setMessages((prev) =>
-            prev.map((msg) => {
-              if (msg.id === userMessage.id) {
-                return { ...msg, retrievedDocs };
-              }
-              if (msg.id === assistantMessageId) {
-                return {
-                  ...msg,
-                  content: "I am sorry, but that topic is out of scope for this website. I can only assist you with questions related to Artificial Intelligence, Robotics, Quantum Computing, and Space Exploration."
-                };
-              }
-              return msg;
-            })
-          );
-          setIsStreaming(false);
-          return;
-        }
-      } else {
-        // Fallback: If DB isn't ready, scrape just the current active page
-        const main = document.querySelector('main')
-        const currentContent = main ? main.innerText.slice(0, 1500) : ''
-        promptContext = `[Document 1] Source page: ${pageContext}\nContent: ${currentContent}`
-      }
-
-      // Add retrieved info to user message for UI display
-      setMessages((prev) =>
-        prev.map((msg) =>
-          msg.id === userMessage.id ? { ...msg, retrievedDocs } : msg
-        )
-      )
-
-      // 2. GENERATION PHASE - Query ChatGPT
-      const systemPrompt = `You are a helpful, premium, context-aware chatbot assistant utilizing a Vector RAG database.
-The user is currently browsing the page titled "${pageContext}".
-
-Below are the most semantically relevant content blocks retrieved from the website database matching the user's specific query:
----------------------
-${promptContext}
----------------------
-
-Please answer the user's questions using the retrieved documents above. 
-
-CRITICAL SCOPE & BOUNDARY RULES:
-- You are strictly an assistant for this website. You are ONLY allowed to answer questions directly related to the topics of this website: Artificial Intelligence, Robotics, Quantum Computing, and Space Exploration (and their general sub-fields).
-- If the user asks a silly question, an off-topic question, or requests actions unrelated to these science and technology topics (e.g., asking for cooking recipes, coding exercises unrelated to the site, writing poems, playing games, sports news, general history, etc.), you MUST politely decline to answer.
-- If a query is out of scope, respond EXACTLY with: "I am sorry, but that topic is out of scope for this website. I can only assist you with questions related to Artificial Intelligence, Robotics, Quantum Computing, and Space Exploration."
-- Try to cite the source page (e.g. "According to the Quantum Computing page...") when answering.
-- Be friendly, accurate, and concise.
-- Use Markdown formatting: bold (**), italics (*), lists, and code blocks with languages (e.g. \`\`\`javascript ... \`\`\`).`
-
-      const conversationHistory = [
-        { role: 'system', content: systemPrompt },
-        ...messages.slice(1).map((m) => ({
-          role: m.role,
-          content: m.content
-        })),
-        { role: 'user', content: trimmed }
-      ]
-
-      const controller = new AbortController()
-      abortControllerRef.current = controller
-
-      const url = keyToUse ? 'https://api.openai.com/v1/chat/completions' : '/api/chat'
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json'
-      }
-      if (keyToUse) {
-        headers['Authorization'] = `Bearer ${keyToUse}`
-      }
-
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: headers,
-        body: JSON.stringify({
-          model: model,
-          messages: conversationHistory,
-          ...(model !== 'gpt-5-nano' ? { temperature } : {}),
-          stream: true
-        }),
-        signal: controller.signal
-      })
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}))
-        throw new Error(errorData.error?.message || `HTTP ${response.status} ${response.statusText}`)
-      }
-
-      if (!response.body) {
-        throw new Error('Response body is empty')
-      }
-
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder('utf-8')
-      let streamTextValue = ''
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-
-        const chunk = decoder.decode(value, { stream: true })
-        const lines = chunk.split('\n')
-
-        for (const line of lines) {
-          const cleanLine = line.trim()
-          if (!cleanLine) continue
-          if (cleanLine === 'data: [DONE]') continue
-
-          if (cleanLine.startsWith('data: ')) {
-            try {
-              const parsed = JSON.parse(cleanLine.substring(6))
-              const content = parsed.choices?.[0]?.delta?.content || ''
-              if (content) {
-                streamTextValue += content
-                setMessages((prev) =>
-                  prev.map((msg) =>
-                    msg.id === assistantMessageId
-                      ? { ...msg, content: streamTextValue }
-                      : msg
-                  )
-                )
-              }
-            } catch (e) {
-              console.error('Error parsing streaming line:', e)
-            }
-          }
-        }
-      }
-    } catch (error: any) {
-      if (error.name === 'AbortError') {
-        console.log('Stream aborted by user')
-      } else {
-        console.error('Chat error:', error)
-        setMessages((prev) =>
-          prev.map((msg) =>
-            msg.id === assistantMessageId
-              ? {
-                ...msg,
-                content: `❌ **Error connecting to OpenAI API:**
-                  
-${error.message || 'An unexpected error occurred. Please verify your internet connection and API key.'}`
-              }
-              : msg
-          )
-        )
-      }
-    } finally {
-      setIsStreaming(false)
-      abortControllerRef.current = null
-    }
-  }
-
-  // Markdown parsing
-  const parseMarkdown = (text: string) => {
-    if (!text) return null
-    const blocks = text.split(/(```[\s\S]*?```)/g)
-
-    return blocks.map((block, bIdx) => {
-      if (block.startsWith('```')) {
-        const match = block.match(/```(\w*)\n([\s\S]*?)```/)
-        const lang = match ? match[1] : 'code'
-        const codeText = match ? match[2] : block.slice(3, -3)
-
-        const handleCopy = (e: React.MouseEvent) => {
-          navigator.clipboard.writeText(codeText.trim())
-          const btn = e.currentTarget as HTMLButtonElement
-          const prevText = btn.innerText
-          btn.innerText = 'Copied!'
-          setTimeout(() => {
-            btn.innerText = prevText
-          }, 1500)
-        }
-
-        return (
-          <div key={`code-${bIdx}`} className="chat-code-block-container">
-            <div className="chat-code-block-header">
-              <span>{lang}</span>
-              <button className="chat-code-block-copy-btn" onClick={handleCopy}>
-                Copy
-              </button>
-            </div>
-            <pre>
-              <code>{codeText.trim()}</code>
-            </pre>
-          </div>
-        )
-      } else {
-        const lines = block.split('\n')
-        return (
-          <React.Fragment key={`text-${bIdx}`}>
-            {lines.map((line, lIdx) => {
-              if (!line.trim() && lIdx !== 0 && lIdx !== lines.length - 1) {
-                return <br key={`br-${lIdx}`} />
-              }
-
-              const boldParts = line.split(/(\*\*.*?\*\*)/g)
-              const renderedLine = boldParts.map((part, pIdx) => {
-                if (part.startsWith('**') && part.endsWith('**')) {
-                  return <strong key={pIdx}>{part.slice(2, -2)}</strong>
-                }
-                const codeParts = part.split(/(`.*?`)/g)
-                return codeParts.map((cPart, cIdx) => {
-                  if (cPart.startsWith('`') && cPart.endsWith('`')) {
-                    return <code key={cIdx}>{cPart.slice(1, -1)}</code>
-                  }
-                  return cPart
-                })
-              })
-
-              return <p key={`line-${lIdx}`}>{renderedLine}</p>
-            })}
-          </React.Fragment>
-        )
-      }
-    })
-  }
-
-  // Helper to render RAG retrieval details (for study/demonstration)
+  // Helper to render RAG retrieval details
   const renderRAGDetails = (docs: Message['retrievedDocs']) => {
     if (!docs || docs.length === 0) return null
     return (
-      <details className="rag-debug-details">
-        <summary>🔍 Vector RAG Retrieval Log ({docs.length} matches)</summary>
-        <div className="rag-debug-content">
+      <details className="self-end max-w-[82%] -mt-2.5 mb-1.5 text-[0.72rem] text-gray-500 border border-black/5 bg-black/[0.015] rounded-md p-1 px-2 cursor-pointer box-border">
+        <summary className="outline-none font-medium select-none">🔍 Vector RAG Retrieval Log ({docs.length} matches)</summary>
+        <div className="mt-1.5 flex flex-col gap-1.5 border-t border-dashed border-black/10 pt-1.5">
           {docs.map((doc, idx) => (
-            <div key={doc.id} className="rag-debug-item">
-              <div className="rag-debug-meta">
+            <div key={doc.id} className="flex flex-col gap-0.5">
+              <div className="flex justify-between font-semibold text-indigo-600">
                 <strong>Rank #{idx + 1}</strong>: {doc.pageTitle} page
-                <span className="rag-debug-score">Match: {doc.score}%</span>
+                <span className="bg-indigo-600/10 text-indigo-600 py-0.5 px-1 rounded text-[0.65rem]">Match: {doc.score}%</span>
               </div>
-              <p className="rag-debug-text">"{doc.text.slice(0, 100)}..."</p>
+              <p className="m-0 text-gray-600 italic text-[0.7rem] leading-[1.3]">"{doc.text.slice(0, 100)}..."</p>
             </div>
           ))}
         </div>
@@ -754,17 +73,17 @@ ${error.message || 'An unexpected error occurred. Please verify your internet co
   // Render database connection badge
   const renderDbBadge = () => {
     if (demoMode) {
-      return <span className="db-badge ready">RAG DB Ready (Demo Mode)</span>
+      return <span className="text-[0.65rem] py-0.5 px-1.5 rounded font-semibold max-w-fit mt-1 border bg-emerald-500/10 text-emerald-500 border-emerald-500/20">RAG DB Ready (Demo Mode)</span>
     }
     switch (dbStatus) {
       case 'ready':
-        return <span className="db-badge ready">RAG DB Ready ({embeddingsDb.length} nodes)</span>
+        return <span className="text-[0.65rem] py-0.5 px-1.5 rounded font-semibold max-w-fit mt-1 border bg-emerald-500/10 text-emerald-500 border-emerald-500/20">RAG DB Ready ({embeddingsDb.length} nodes)</span>
       case 'loading':
-        return <span className="db-badge loading">Initializing RAG Vectors...</span>
+        return <span className="text-[0.65rem] py-0.5 px-1.5 rounded font-semibold max-w-fit mt-1 border bg-amber-500/10 text-amber-600 border-amber-500/20 animate-pulse">Initializing RAG Vectors...</span>
       case 'error':
-        return <span className="db-badge error" title={dbError}>RAG DB Setup Failed ⚠️</span>
+        return <span className="text-[0.65rem] py-0.5 px-1.5 rounded font-semibold max-w-fit mt-1 border bg-red-500/10 text-red-500 border-red-500/20" title={dbError}>RAG DB Setup Failed ⚠️</span>
       default:
-        return <span className="db-badge pending">RAG DB Pending Key</span>
+        return <span className="text-[0.65rem] py-0.5 px-1.5 rounded font-semibold max-w-fit mt-1 border bg-gray-500/10 text-gray-500 border-gray-500/20">RAG DB Pending Key</span>
     }
   }
 
@@ -772,37 +91,46 @@ ${error.message || 'An unexpected error occurred. Please verify your internet co
     <>
       {/* Floating Action Button (FAB) */}
       <button
-        className="chat-widget-fab"
+        className="fixed bottom-6 right-6 w-14 h-14 rounded-full bg-gradient-to-br from-indigo-600 to-cyan-500 text-white flex items-center justify-center border-none cursor-pointer shadow-[0_4px_20px_rgba(79,70,229,0.35)] transition-all duration-300 ease-[cubic-bezier(0.175,0.885,0.32,1.275)] hover:scale-110 hover:rotate-5 hover:shadow-[0_6px_24px_rgba(79,70,229,0.5)] active:scale-95 z-[1000]"
         onClick={() => setIsOpen(!isOpen)}
         title="Chat with AI"
         aria-label="Toggle chat widget"
       >
         {isOpen ? (
-          <svg viewBox="0 0 24 24">
+          <svg viewBox="0 0 24 24" className="w-[26px] h-[26px] fill-current">
             <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
           </svg>
         ) : (
-          <svg viewBox="0 0 24 24">
+          <svg viewBox="0 0 24 24" className="w-[26px] h-[26px] fill-current">
             <path d="M20 2H4c-1.1 0-1.99.9-1.99 2L2 22l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM6 9h12v2H6V9zm8 5H6v-2h8v2zm4-6H6V6h12v2z" />
           </svg>
         )}
-        {hasNewMessage && <span className="chat-fab-badge" />}
+        {hasNewMessage && <span className="absolute -top-0.5 -right-0.5 w-3.5 h-3.5 bg-red-500 border-2 border-white rounded-full animate-pulse" />}
       </button>
 
       {/* Sidebar Chat Box */}
-      <div className={`chat-sidebar ${isOpen ? 'open' : ''}`}>
+      <div
+        className={`fixed z-[1001] flex flex-col overflow-hidden bg-white/82 backdrop-blur-2xl shadow-[0_12px_48px_rgba(0,0,0,0.15)] border border-black/8 rounded-[20px] 
+          max-[480px]:bottom-0 max-[480px]:right-0 max-[480px]:w-full max-[480px]:h-full max-[480px]:max-h-full max-[480px]:rounded-none max-[480px]:border-none
+          transition-all duration-[350ms] ease-[cubic-bezier(0.34,1.56,0.64,1)]
+          bottom-24 right-6 w-[380px] h-[600px] max-h-[calc(100vh-140px)]
+          ${isOpen
+            ? 'opacity-100 pointer-events-auto translate-y-0 scale-100 max-[480px]:translate-y-0'
+            : 'opacity-0 pointer-events-none translate-y-[30px] scale-[0.95] max-[480px]:translate-y-[100%] max-[480px]:scale-100 max-[480px]:opacity-100'
+          }`}
+      >
         {/* Chat Header */}
-        <div className="chat-header">
-          <div className="chat-header-info">
-            <h3 className="chat-header-title">
-              <span className="chat-status-dot" /> {botName}
+        <div className="p-4 px-5 border-b border-black/6 flex justify-between items-center bg-white/50">
+          <div className="flex flex-col">
+            <h3 className="text-[0.95rem] font-bold text-gray-800 m-0 flex items-center gap-2">
+              <span className="w-2 h-2 bg-emerald-500 rounded-full inline-block" /> {botName}
             </h3>
             {renderDbBadge()}
           </div>
 
-          <div className="chat-header-actions">
+          <div className="flex gap-1.5">
             <button
-              className="chat-header-btn"
+              className="bg-transparent border-none text-gray-600 cursor-pointer p-1.5 rounded-md flex items-center justify-center transition-all duration-200 hover:bg-black/5 hover:text-gray-900"
               onClick={() => setShowSettings(true)}
               title="Chat Settings / Rebuild Index"
               aria-label="Chat Settings"
@@ -815,7 +143,7 @@ ${error.message || 'An unexpected error occurred. Please verify your internet co
               </svg>
             </button>
             <button
-              className="chat-header-btn"
+              className="bg-transparent border-none text-gray-600 cursor-pointer p-1.5 rounded-md flex items-center justify-center transition-all duration-200 hover:bg-black/5 hover:text-gray-900"
               onClick={() => setIsOpen(false)}
               title="Close sidebar"
               aria-label="Close sidebar"
@@ -829,11 +157,11 @@ ${error.message || 'An unexpected error occurred. Please verify your internet co
 
         {/* Suggestion Chips */}
         {messages.length === 1 && !isStreaming && (
-          <div className="chat-suggestions">
+          <div className="flex flex-wrap gap-2 p-3 px-5 pb-0">
             {getSuggestionChips().map((chip, idx) => (
               <button
                 key={idx}
-                className="suggestion-chip"
+                className="bg-white border border-black/8 rounded-xl py-1.5 px-3 text-[0.78rem] text-gray-600 cursor-pointer transition-all duration-200 shadow-[0_2px_6px_rgba(0,0,0,0.02)] hover:border-indigo-600 hover:text-indigo-600 hover:bg-indigo-600/2 hover:-translate-y-0.5"
                 onClick={() => handleSendMessage(chip)}
               >
                 {chip}
@@ -843,22 +171,27 @@ ${error.message || 'An unexpected error occurred. Please verify your internet co
         )}
 
         {/* Messages List */}
-        <div className="chat-messages">
+        <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-4">
           {messages.map((msg) => (
-            <div key={msg.id} className="chat-msg-block-container" style={{ display: 'flex', flexDirection: 'column' }}>
-              <div className={`chat-message-wrapper ${msg.role}`}>
-                <div className="chat-message-bubble">
+            <div key={msg.id} className="flex flex-col">
+              <div className={`flex max-w-[82%] flex-col gap-1 ${msg.role === 'user' ? 'self-end' : 'self-start'}`}>
+                <div
+                  className={`p-3 px-4 rounded-2xl text-[0.88rem] leading-[1.45] break-words ${msg.role === 'user'
+                    ? 'bg-gradient-to-br from-indigo-600 to-indigo-700 text-white rounded-br-sm shadow-[0_4px_12px_rgba(79,70,229,0.15)]'
+                    : 'bg-gray-100 text-gray-800 rounded-bl-sm border border-black/3'
+                    }`}
+                >
                   {msg.content ? (
-                    parseMarkdown(msg.content)
+                    parseMarkdown(msg.content, msg.role === 'user')
                   ) : (
-                    <div className="typing-indicator">
-                      <span className="typing-dot" />
-                      <span className="typing-dot" />
-                      <span className="typing-dot" />
+                    <div className="flex gap-1 items-center h-[18px]">
+                      <span className="w-1.5 h-1.5 bg-gray-400 rounded-full inline-block animate-bounce" style={{ animationDelay: '-0.32s' }} />
+                      <span className="w-1.5 h-1.5 bg-gray-400 rounded-full inline-block animate-bounce" style={{ animationDelay: '-0.16s' }} />
+                      <span className="w-1.5 h-1.5 bg-gray-400 rounded-full inline-block animate-bounce" />
                     </div>
                   )}
                 </div>
-                <span className="chat-message-time">
+                <span className={`text-[0.68rem] text-gray-400 mt-0.5 ${msg.role === 'user' ? 'self-end mr-1' : 'self-start ml-1'}`}>
                   {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                 </span>
               </div>
@@ -871,8 +204,11 @@ ${error.message || 'An unexpected error occurred. Please verify your internet co
 
         {/* Stop Stream Button */}
         {isStreaming && (
-          <button className="chat-stop-btn" onClick={handleStopStream}>
-            <svg viewBox="0 0 24 24">
+          <button
+            className="flex items-center gap-1.5 bg-red-500/8 border border-red-500/15 rounded-lg py-1.5 px-3 text-[0.75rem] font-semibold text-red-500 cursor-pointer self-center mb-2 transition-all duration-200 hover:bg-red-500/15"
+            onClick={handleStopStream}
+          >
+            <svg viewBox="0 0 24 24" className="w-3 h-3 fill-current">
               <path d="M6 19h12V5H6v14z" />
             </svg>
             Stop generating
@@ -880,11 +216,11 @@ ${error.message || 'An unexpected error occurred. Please verify your internet co
         )}
 
         {/* Chat Input */}
-        <div className="chat-input-container">
-          <div className="chat-input-row">
+        <div className="p-4 px-5 border-t border-black/6 flex gap-2.5 items-end bg-white/50">
+          <div className="flex gap-2.5 w-full items-end">
             <textarea
               ref={textareaRef}
-              className="chat-input-textarea"
+              className="flex-1 border border-black/8 rounded-xl py-2.5 px-3.5 text-[0.88rem] resize-none outline-none max-h-[120px] h-10 leading-[1.4] bg-white text-gray-800 transition-all duration-200 focus:border-indigo-600 focus:shadow-[0_0_0_3px_rgba(79,70,229,0.1)]"
               placeholder={dbStatus === 'ready' ? "Ask anything (Cross-page RAG active)..." : "Enter API key to unlock RAG..."}
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
@@ -898,12 +234,12 @@ ${error.message || 'An unexpected error occurred. Please verify your internet co
               rows={1}
             />
             <button
-              className="chat-send-btn"
+              className="w-10 h-10 rounded-xl bg-indigo-600 text-white border-none cursor-pointer flex items-center justify-center transition-all duration-200 shrink-0 hover:bg-indigo-700 hover:-translate-y-0.5 active:translate-y-0 disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed disabled:transform-none"
               onClick={() => handleSendMessage(inputValue)}
               disabled={isStreaming || !inputValue.trim()}
               aria-label="Send message"
             >
-              <svg viewBox="0 0 24 24">
+              <svg viewBox="0 0 24 24" className="w-5 h-5 fill-current">
                 <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
               </svg>
             </button>
@@ -912,11 +248,11 @@ ${error.message || 'An unexpected error occurred. Please verify your internet co
 
         {/* Settings Panel Overlay */}
         {showSettings && (
-          <div className="chat-settings-overlay">
-            <div className="chat-settings-header">
-              <h4 className="chat-settings-title">RAG Engine Settings</h4>
+          <div className="absolute top-0 left-0 w-full h-full bg-white/95 backdrop-blur-md z-[1005] flex flex-col p-6 box-border animate-[fade-in_0.25s_ease-out]">
+            <div className="flex justify-between items-center mb-5">
+              <h4 className="text-base font-bold text-gray-800 m-0">RAG Engine Settings</h4>
               <button
-                className="chat-header-btn"
+                className="bg-transparent border-none text-gray-600 cursor-pointer p-1.5 rounded-md flex items-center justify-center transition-all duration-200 hover:bg-black/5 hover:text-gray-900"
                 onClick={() => setShowSettings(false)}
                 aria-label="Close settings"
               >
@@ -926,27 +262,27 @@ ${error.message || 'An unexpected error occurred. Please verify your internet co
               </button>
             </div>
 
-            <form onSubmit={handleSaveSettings} className="chat-settings-form">
-              <div className="chat-settings-group">
-                <label htmlFor="setting-api-key">OpenAI API Key</label>
+            <form onSubmit={handleSaveSettings} className="flex flex-col gap-4 overflow-y-auto pr-1">
+              <div className="flex flex-col gap-1.5">
+                <label className="block text-[0.72rem] font-bold text-gray-500 uppercase tracking-wider mb-1" htmlFor="setting-api-key">OpenAI API Key</label>
                 <input
                   id="setting-api-key"
                   type="password"
-                  className="chat-settings-input"
+                  className="w-full border border-black/8 rounded-lg p-2.5 text-[0.88rem] bg-white text-gray-800 outline-none transition-all duration-200 focus:border-indigo-600 focus:shadow-[0_0_0_3px_rgba(79,70,229,0.1)]"
                   placeholder="sk-..."
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
                 />
-                <span className="chat-settings-help">
+                <span className="block text-[0.68rem] text-gray-400 mt-1">
                   Required to generate embeddings and run vector searches. Saved locally in browser.
                 </span>
               </div>
 
-              <div className="chat-settings-group">
-                <label htmlFor="setting-model">Completions Model</label>
+              <div className="flex flex-col gap-1.5">
+                <label className="block text-[0.72rem] font-bold text-gray-500 uppercase tracking-wider mb-1" htmlFor="setting-model">Completions Model</label>
                 <select
                   id="setting-model"
-                  className="chat-settings-select"
+                  className="w-full border border-black/8 rounded-lg p-2.5 text-[0.88rem] bg-white text-gray-800 outline-none transition-all duration-200 focus:border-indigo-600 focus:shadow-[0_0_0_3px_rgba(79,70,229,0.1)]"
                   value={model}
                   onChange={(e) => setModel(e.target.value)}
                 >
@@ -957,26 +293,25 @@ ${error.message || 'An unexpected error occurred. Please verify your internet co
                 </select>
               </div>
 
-              <div className="chat-settings-group">
-                <label htmlFor="setting-temp">Temperature ({temperature})</label>
+              <div className="flex flex-col gap-1.5">
+                <label className="block text-[0.72rem] font-bold text-gray-500 uppercase tracking-wider mb-1" htmlFor="setting-temp">Temperature ({temperature})</label>
                 <input
                   id="setting-temp"
                   type="range"
                   min="0"
                   max="1.5"
                   step="0.1"
-                  className="chat-settings-input"
+                  className="w-full border border-black/8 rounded-lg p-2.5 text-[0.88rem] bg-white text-gray-800 outline-none transition-all duration-200 focus:border-indigo-600 focus:shadow-[0_0_0_3px_rgba(79,70,229,0.1)]"
                   value={temperature}
                   onChange={(e) => setTemperature(parseFloat(e.target.value))}
                 />
               </div>
 
-              <div className="chat-settings-group" style={{ marginTop: '10px', padding: '12px', border: '1px solid rgba(0,0,0,0.06)', borderRadius: '8px', backgroundColor: 'rgba(0,0,0,0.02)' }}>
-                <span style={{ fontSize: '0.8rem', fontWeight: 600, display: 'block', marginBottom: '4px' }}>Vector Database Actions:</span>
+              <div className="mt-2.5 p-3 border border-black/6 rounded-lg bg-black/[0.015]">
+                <span className="block text-[0.8rem] font-semibold text-gray-700 mb-1">Vector Database Actions:</span>
                 <button
                   type="button"
-                  className="chat-settings-save-btn"
-                  style={{ background: '#4b5563', padding: '8px', fontSize: '0.8rem', width: '100%', marginTop: '4px' }}
+                  className="w-full bg-gray-500 hover:bg-gray-600 text-white py-2 px-3 text-[0.8rem] rounded-lg cursor-pointer transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
                   onClick={() => initializeVectorDb(true)}
                   disabled={!getApiKey()}
                 >
@@ -984,7 +319,7 @@ ${error.message || 'An unexpected error occurred. Please verify your internet co
                 </button>
               </div>
 
-              <button type="submit" className="chat-settings-save-btn">
+              <button type="submit" className="mt-5 w-full bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-xl font-bold cursor-pointer transition-all duration-200 shadow-[0_4px_12px_rgba(79,70,229,0.2)] hover:-translate-y-0.5 active:translate-y-0">
                 Save & Close
               </button>
             </form>
