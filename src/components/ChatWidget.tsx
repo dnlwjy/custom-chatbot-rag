@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { useLocation } from 'react-router-dom'
-import { KNOWLEDGE_BASE_CHUNKS } from '../data/knowledgeBase'
+import { KNOWLEDGE_BASE_CHUNKS, type KnowledgeChunk } from '../data/knowledgeBase'
 import './ChatWidget.css'
 
 interface Message {
@@ -21,7 +21,19 @@ interface CachedEmbedding {
   vector: number[]
 }
 
-export default function ChatWidget() {
+export interface ChatWidgetProps {
+  knowledgeBase?: KnowledgeChunk[]
+  botName?: string
+  welcomeMessage?: string
+  demoMode?: boolean
+}
+
+export default function ChatWidget({
+  knowledgeBase = KNOWLEDGE_BASE_CHUNKS,
+  botName = 'RAG AI Assistant',
+  welcomeMessage,
+  demoMode = true
+}: ChatWidgetProps) {
   const location = useLocation()
   const [isOpen, setIsOpen] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -52,6 +64,7 @@ export default function ChatWidget() {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const abortControllerRef = useRef<AbortController | null>(null)
+  const mockIntervalRef = useRef<any>(null)
 
   // Map route to user-friendly page context name
   const getPageContext = () => {
@@ -138,6 +151,7 @@ export default function ChatWidget() {
       method: 'POST',
       headers: headers,
       body: JSON.stringify({
+        model: 'text-embedding-3-small',
         input: text
       })
     })
@@ -167,6 +181,7 @@ export default function ChatWidget() {
       method: 'POST',
       headers: headers,
       body: JSON.stringify({
+        model: 'text-embedding-3-small',
         input: texts
       })
     })
@@ -229,8 +244,12 @@ export default function ChatWidget() {
 
   // Trigger vector DB initialization on mount or key/settings change
   useEffect(() => {
-    initializeVectorDb()
-  }, [apiKey])
+    if (demoMode) {
+      setDbStatus('ready')
+    } else {
+      initializeVectorDb()
+    }
+  }, [apiKey, demoMode])
 
   // --- CHAT CONVERSATION FLOW ---
 
@@ -240,7 +259,7 @@ export default function ChatWidget() {
     const welcomeMsg: Message = {
       id: 'welcome-' + location.pathname,
       role: 'assistant',
-      content: `Hello! I am your RAG-powered AI assistant.
+      content: welcomeMessage || `Hello! I am your RAG-powered AI assistant.
 
 I have loaded a semantic search index of the **entire website** (12 paragraphs across all 4 pages). 
 
@@ -269,6 +288,18 @@ You can ask me questions about **${context}**, or test the RAG capability by ask
     }
   }, [isOpen])
 
+  // Toggle 'chat-open' class on body to shift page layout
+  useEffect(() => {
+    if (isOpen) {
+      document.body.classList.add('chat-open')
+    } else {
+      document.body.classList.remove('chat-open')
+    }
+    return () => {
+      document.body.classList.remove('chat-open')
+    }
+  }, [isOpen])
+
   // Auto-resize input textarea
   useEffect(() => {
     if (textareaRef.current) {
@@ -290,6 +321,11 @@ You can ask me questions about **${context}**, or test the RAG capability by ask
   const handleStopStream = () => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort()
+      setIsStreaming(false)
+    }
+    if (mockIntervalRef.current) {
+      clearInterval(mockIntervalRef.current)
+      mockIntervalRef.current = null
       setIsStreaming(false)
     }
   }
@@ -317,6 +353,106 @@ You can ask me questions about **${context}**, or test the RAG capability by ask
 
     setMessages((prev) => [...prev, userMessage, assistantMessagePlaceholder])
     setIsStreaming(true)
+
+    if (demoMode) {
+      // 1. MOCK RAG PHASE - Search over knowledgeBase using local keyword math
+      // Clean and split query words
+      const queryWords = trimmed.toLowerCase()
+        .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, "")
+        .split(/\s+/)
+        .filter(word => word.length > 2);
+
+      let matchedDocs: any[] = [];
+      
+      if (queryWords.length > 0) {
+        const scored = knowledgeBase.map(chunk => {
+          const docTextLower = chunk.text.toLowerCase();
+          const pageTitleLower = chunk.pageTitle.toLowerCase();
+          let matchCount = 0;
+          queryWords.forEach(word => {
+            if (docTextLower.includes(word)) {
+              matchCount += 1;
+              if (pageTitleLower.includes(word)) {
+                matchCount += 1.5;
+              }
+            }
+          });
+          
+          // Calculate score (normalized)
+          const score = matchCount > 0 ? Math.min(30 + (matchCount * 15), 98) : 0;
+          return { ...chunk, score };
+        });
+
+        matchedDocs = scored
+          .filter(item => item.score > 0)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 3);
+      }
+
+      const retrievedDocs: Message['retrievedDocs'] = matchedDocs.map(chunk => ({
+        id: chunk.id,
+        pageTitle: chunk.pageTitle,
+        score: chunk.score,
+        text: chunk.text
+      }));
+
+      // Add retrieved docs to user message for UI display
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === userMessage.id ? { ...msg, retrievedDocs } : msg
+        )
+      );
+
+      // Check for out of scope
+      const isGreeting = /^(hi|hello|hey|good\s+morning|good\s+afternoon|good\s+evening|yo|greetings|help|who\s+are\s+you|what\s+is\s+this\s+website|what\s+can\s+you\s+do|how\s+to\s+use)(\b|\?|$)/i.test(trimmed);
+      const maxScore = retrievedDocs.length > 0 ? Math.max(...retrievedDocs.map(d => d.score)) : 0;
+
+      let responseText = "";
+
+      if (!isGreeting && maxScore < 30) {
+        responseText = "I am sorry, but that topic is out of scope for this website. I can only assist you with questions related to Artificial Intelligence, Robotics, Quantum Computing, and Space Exploration.";
+      } else if (isGreeting) {
+        responseText = `Hello! I am your RAG AI Assistant (running in Demo Mode). 
+
+I can answer questions using context from the current page (**${pageContext}**) or search across all pages of the site using local mock RAG. Ask me anything about Artificial Intelligence, Robotics, Quantum Computing, or Space Exploration!`;
+      } else {
+        const topDoc = matchedDocs[0];
+        responseText = `This will be a response generated by the RAG AI about **${topDoc.pageTitle}**.
+
+Based on the retrieved website documentation:
+> *"${topDoc.text.slice(0, 160)}..."*
+
+Here is what we know:
+1. This is a **Mock Demo Response** illustrating the client-side RAG engine.
+2. The user query matched the **${topDoc.category}** category with a simulated similarity score of **${maxScore}%**.
+3. In a production environment, this matched text block would be fed into the OpenAI model to generate a custom answer.`;
+      }
+
+      // Stream the mock response character by character
+      let currentContent = '';
+      let charIndex = 0;
+      
+      const interval = setInterval(() => {
+        if (charIndex < responseText.length) {
+          currentContent += responseText.charAt(charIndex);
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMessageId
+                ? { ...msg, content: currentContent }
+                : msg
+            )
+          );
+          charIndex++;
+        } else {
+          clearInterval(interval);
+          setIsStreaming(false);
+          mockIntervalRef.current = null;
+        }
+      }, 15);
+
+      mockIntervalRef.current = interval as any;
+      return;
+    }
 
     const keyToUse = getApiKey()
 
@@ -617,6 +753,9 @@ ${error.message || 'An unexpected error occurred. Please verify your internet co
 
   // Render database connection badge
   const renderDbBadge = () => {
+    if (demoMode) {
+      return <span className="db-badge ready">RAG DB Ready (Demo Mode)</span>
+    }
     switch (dbStatus) {
       case 'ready':
         return <span className="db-badge ready">RAG DB Ready ({embeddingsDb.length} nodes)</span>
@@ -656,7 +795,7 @@ ${error.message || 'An unexpected error occurred. Please verify your internet co
         <div className="chat-header">
           <div className="chat-header-info">
             <h3 className="chat-header-title">
-              <span className="chat-status-dot" /> AI RAG Assistant
+              <span className="chat-status-dot" /> {botName}
             </h3>
             {renderDbBadge()}
           </div>
