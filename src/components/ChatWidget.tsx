@@ -126,14 +126,18 @@ export default function ChatWidget() {
 
   // Generate vector embedding for a single text (uses text-embedding-3-small)
   const fetchEmbedding = async (text: string, key: string): Promise<number[]> => {
-    const res = await fetch('https://api.openai.com/v1/embeddings', {
+    const url = key ? 'https://api.openai.com/v1/embeddings' : '/api/embeddings'
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json'
+    }
+    if (key) {
+      headers['Authorization'] = `Bearer ${key}`
+    }
+
+    const res = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${key}`
-      },
+      headers: headers,
       body: JSON.stringify({
-        model: 'text-embedding-3-small',
         input: text
       })
     })
@@ -144,19 +148,25 @@ export default function ChatWidget() {
     }
 
     const json = await res.json()
+    // For direct OpenAI API response it is json.data[0].embedding.
+    // Our proxy returns the exact same payload.
     return json.data[0].embedding
   }
 
   // Fetch embeddings in batch for all database chunks
   const fetchBatchEmbeddings = async (texts: string[], key: string): Promise<number[][]> => {
-    const res = await fetch('https://api.openai.com/v1/embeddings', {
+    const url = key ? 'https://api.openai.com/v1/embeddings' : '/api/embeddings'
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json'
+    }
+    if (key) {
+      headers['Authorization'] = `Bearer ${key}`
+    }
+
+    const res = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${key}`
-      },
+      headers: headers,
       body: JSON.stringify({
-        model: 'text-embedding-3-small',
         input: texts
       })
     })
@@ -173,10 +183,6 @@ export default function ChatWidget() {
   // Initialize/build vector database
   const initializeVectorDb = async (forceRebuild = false) => {
     const key = getApiKey()
-    if (!key) {
-      setDbStatus('pending')
-      return
-    }
 
     setDbStatus('loading')
     setDbError('')
@@ -195,7 +201,7 @@ export default function ChatWidget() {
         }
       }
 
-      // No cache, or mismatch, or forced rebuild: generate embeddings from OpenAI
+      // Fetch batch embeddings (will run directly if key is configured, or route to /api/embeddings proxy)
       const textsToEmbed = KNOWLEDGE_BASE_CHUNKS.map((c) => c.text)
       const vectors = await fetchBatchEmbeddings(textsToEmbed, key)
 
@@ -209,8 +215,15 @@ export default function ChatWidget() {
       setDbStatus('ready')
     } catch (err: any) {
       console.error('Failed to build vector DB:', err)
-      setDbError(err.message || 'Error creating embeddings')
-      setDbStatus('error')
+
+      // If we don't have a local key AND the proxy fails (e.g. running locally without Vercel API routes),
+      // we gracefully fall back to 'pending' to prompt the developer for a key.
+      if (!key) {
+        setDbStatus('pending')
+      } else {
+        setDbError(err.message || 'Error creating embeddings')
+        setDbStatus('error')
+      }
     }
   }
 
@@ -307,7 +320,8 @@ You can ask me questions about **${context}**, or test the RAG capability by ask
 
     const keyToUse = getApiKey()
 
-    if (!keyToUse) {
+    // If no key is set locally, AND we don't have a ready RAG vector database (e.g. proxy is offline or not configured)
+    if (!keyToUse && dbStatus !== 'ready') {
       setTimeout(() => {
         setMessages((prev) =>
           prev.map((msg) =>
@@ -426,12 +440,17 @@ CRITICAL SCOPE & BOUNDARY RULES:
       const controller = new AbortController()
       abortControllerRef.current = controller
 
-      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      const url = keyToUse ? 'https://api.openai.com/v1/chat/completions' : '/api/chat'
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json'
+      }
+      if (keyToUse) {
+        headers['Authorization'] = `Bearer ${keyToUse}`
+      }
+
+      const response = await fetch(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${keyToUse}`
-        },
+        headers: headers,
         body: JSON.stringify({
           model: model,
           messages: conversationHistory,
