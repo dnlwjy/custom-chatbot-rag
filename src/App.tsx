@@ -3,6 +3,7 @@ import Home from './pages/ArtificialIntelligence'
 import About from './pages/Robotics'
 import Services from './pages/QuantumComputing'
 import Contact from './pages/SpaceExploration'
+import ChatWidget from './components/ChatWidget'
 
 function App() {
   return (
@@ -24,9 +25,11 @@ function App() {
             <Route path="/contact" element={<Contact />} />
           </Routes>
         </main>
+        <ChatWidget />
       </div>
     </Router>
   )
 }
 
 export default App
+
